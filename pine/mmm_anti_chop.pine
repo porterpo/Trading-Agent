@@ -61,18 +61,12 @@ inValidSession = not useKillZones or (inLondon or inNY)
 // Serialises indicator state as JSON — TradingView posts this verbatim
 // to https://<railway-domain>/webhook/signal.
 mkPayload(_sig, _price, _level, _anchor, _fib618, _fib786, _ema200, _adrPips) =>
-    '{' +
-    '"symbol":"'         + syminfo.ticker    + '"' +
-    ',"timeframe":"'     + timeframe.period  + '"' +
-    ',"signal":"'        + _sig              + '"' +
-    ',"price":'          + str.tostring(_price)   +
-    ',"level":"'         + _level            + '"' +
-    ',"anchor_wick":'    + str.tostring(_anchor)  +
-    ',"fib_618":'        + str.tostring(_fib618)  +
-    ',"fib_786":'        + str.tostring(_fib786)  +
-    ',"ema_200":'        + str.tostring(_ema200)  +
-    ',"daily_adr_pips":' + str.tostring(_adrPips) +
-    '}'
+    p1 = '{"symbol":"' + syminfo.ticker + '","timeframe":"' + timeframe.period + '"'
+    p2 = ',"signal":"' + _sig + '","price":' + str.tostring(_price)
+    p3 = ',"level":"' + _level + '","anchor_wick":' + str.tostring(_anchor)
+    p4 = ',"fib_618":' + str.tostring(_fib618) + ',"fib_786":' + str.tostring(_fib786)
+    p5 = ',"ema_200":' + str.tostring(_ema200) + ',"daily_adr_pips":' + str.tostring(_adrPips)
+    p1 + p2 + p3 + p4 + p5 + '}'
 
 // ==========================================
 // 4. PEAK FORMATION & RESET STATE
