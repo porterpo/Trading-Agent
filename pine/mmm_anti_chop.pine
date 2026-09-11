@@ -1,0 +1,262 @@
+//@version=5
+indicator("MMM Anti-Chop Engine (Webhook JSON)", overlay=true, max_labels_count=500, max_boxes_count=500, max_lines_count=500)
+
+// ==========================================
+// 1. INPUTS & CONFIGURATION
+// ==========================================
+useStrictPeaks  = input.bool(false, title="Enable Strict Peak Filters (TDI + ADR Gates)", group="Peak Sensitivity")
+
+adrLength       = input.int(5, title="ADR Length (Days)", group="BTMM Cycle Setup")
+minCycleMult    = input.float(1.5, title="Min Cycle ADR Multiplier", group="BTMM Cycle Setup")
+superCycleMult  = input.float(4.5, title="Super Cycle / Level 3 ADR Threshold", group="BTMM Cycle Setup")
+
+useSlopeFilter  = input.bool(true, title="Enable 200 EMA Slope Filter", group="Anti-Chop Filters")
+useChopIndex    = input.bool(true, title="Enable Choppiness Index Filter", group="Anti-Chop Filters")
+maxChopLevel    = input.float(61.8, title="Max Choppiness Index (Max 100)", group="Anti-Chop Filters")
+
+useSweepFilter  = input.bool(true, title="Require Wick Sweep (M/W Pattern)", group="Pattern Filters")
+
+useKillZones    = input.bool(true, title="Filter Prime Entries by Kill Zones", group="Session Filters")
+londonSession   = input.session("0700-1000:23456", title="London Kill Zone (UTC)", group="Session Filters")
+nySession       = input.session("1200-1500:23456", title="New York Kill Zone (UTC)", group="Session Filters")
+
+showFibBoxes    = input.bool(true, title="Highlight Prime Fib Zones", group="Visual Options")
+showTPs         = input.bool(true, title="Draw Take Profit Target Lines", group="Visual Options")
+
+// ==========================================
+// 2. INDICATORS & AUTO-SCALING
+// ==========================================
+ema13  = ta.ema(close, 13)
+ema50  = ta.ema(close, 50)
+ema200 = ta.ema(close, 200)
+
+plot(ema13, "13 EMA", color=color.red, linewidth=2)
+plot(ema50, "50 EMA", color=color.aqua, linewidth=2)
+plot(ema200, "200 EMA", color=color.white, linewidth=2)
+
+dHigh = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_on)
+dLow  = request.security(syminfo.tickerid, "D", low[1],  lookahead=barmerge.lookahead_on)
+adr   = ta.sma(dHigh - dLow, adrLength)
+
+// ADR expressed in pips — works for 5-digit FX and 3-digit JPY brokers
+adrPips = adr / syminfo.mintick / 10.0
+
+dynamicSlopeThresh = (adr * 0.01) / syminfo.mintick
+ema200Slope        = math.abs(ema200 - ema200[5]) / syminfo.mintick
+isTrending         = not useSlopeFilter or (ema200Slope >= dynamicSlopeThresh)
+
+ciTrueRange   = ta.tr
+ciSumTR       = math.sum(ciTrueRange, 14)
+ciHighLowDiff = ta.highest(high, 14) - ta.lowest(low, 14)
+chopIndex     = 100 * (math.log10(ciSumTR / ciHighLowDiff) / math.log10(14))
+isNotChoppy   = not useChopIndex or (chopIndex < maxChopLevel)
+
+inLondon = not na(time(timeframe.period, londonSession, "UTC"))
+inNY     = not na(time(timeframe.period, nySession,     "UTC"))
+inValidSession = not useKillZones or (inLondon or inNY)
+
+// ==========================================
+// 3. WEBHOOK PAYLOAD BUILDER
+// ==========================================
+// Serialises indicator state as JSON — TradingView posts this verbatim
+// to https://<railway-domain>/webhook/signal.
+mkPayload(_sig, _price, _level, _anchor, _fib618, _fib786, _ema200, _adrPips) =>
+    '{' +
+    '"symbol":"'         + syminfo.ticker    + '"' +
+    ',"timeframe":"'     + timeframe.period  + '"' +
+    ',"signal":"'        + _sig              + '"' +
+    ',"price":'          + str.tostring(_price)   +
+    ',"level":"'         + _level            + '"' +
+    ',"anchor_wick":'    + str.tostring(_anchor)  +
+    ',"fib_618":'        + str.tostring(_fib618)  +
+    ',"fib_786":'        + str.tostring(_fib786)  +
+    ',"ema_200":'        + str.tostring(_ema200)  +
+    ',"daily_adr_pips":' + str.tostring(_adrPips) +
+    '}'
+
+// ==========================================
+// 4. PEAK FORMATION & RESET STATE
+// ==========================================
+var float lastPeakPrice      = na
+var string lastPeakType      = na
+var int   lastPeakBar        = na
+var int   btmmLevel          = 0
+var int   lastResetBar       = na
+
+var float lockedAnchorPrice   = na
+var float lockedBreakoutPrice = na
+var float fib618Level        = na
+var float fib786Level        = na
+var box   activeFibBox       = na
+
+emaCrossUp   = ta.crossover(ema13,  ema50)
+emaCrossDown = ta.crossunder(ema13, ema50)
+
+bool peakCooldown = na(lastPeakBar) or (bar_index - lastPeakBar >= 5)
+
+cycleDistance = na(lastPeakPrice) ? 99999.0 : math.abs(close - lastPeakPrice)
+isMinCycle    = cycleDistance >= (minCycleMult * adr)
+isSuperCycle  = cycleDistance >= (superCycleMult * adr)
+
+bool confirmedPFL = emaCrossUp   and peakCooldown and (not useStrictPeaks or (isMinCycle and isTrending and isNotChoppy))
+bool confirmedPFH = emaCrossDown and peakCooldown and (not useStrictPeaks or (isMinCycle and isTrending and isNotChoppy))
+
+// ---------- PFH ----------
+if confirmedPFH and barstate.isconfirmed
+    int highestOffset = math.abs(ta.highestbars(high, 10))
+    int lookbackVal   = highestOffset > 0 ? highestOffset : 1
+    int lowestOffset  = math.abs(ta.lowestbars(low, lookbackVal))
+
+    lockedAnchorPrice   := high[highestOffset]
+    lockedBreakoutPrice := low[lowestOffset]
+
+    lastPeakPrice := lockedAnchorPrice
+    lastPeakType  := "PFH"
+    lastPeakBar   := bar_index - highestOffset
+    btmmLevel     := 1
+
+    float swingRange = lockedAnchorPrice - lockedBreakoutPrice
+    fib618Level     := lockedAnchorPrice - (swingRange * 0.618)
+    fib786Level     := lockedAnchorPrice - (swingRange * 0.786)
+
+    string labelText = isSuperCycle ? "L3 / SUPER CYCLE\nPFH Confirmed" : "PFH Confirmed\n(L1 Expansion)"
+    color  labelColor = isSuperCycle ? color.purple : color.red
+    label.new(bar_index - highestOffset, lockedAnchorPrice, labelText, color=labelColor, style=label.style_label_down, textcolor=color.white)
+
+    if showFibBoxes
+        box.delete(activeFibBox)
+        activeFibBox := box.new(bar_index, fib618Level, bar_index + 30, fib786Level, border_color=color.red, bgcolor=color.new(color.red, 85))
+
+    // Webhook payload — SUPER CYCLE flips level to L3, otherwise L1
+    string _sig = isSuperCycle ? "SUPER CYCLE PFH" : "PFH Confirmed"
+    string _lvl = isSuperCycle ? "L3" : "L1"
+    alert(mkPayload(_sig, close, _lvl, lockedAnchorPrice, fib618Level, fib786Level, ema200, adrPips), alert.freq_once_per_bar_close)
+
+// ---------- PFL ----------
+if confirmedPFL and barstate.isconfirmed
+    int lowestOffset  = math.abs(ta.lowestbars(low, 10))
+    int lookbackVal   = lowestOffset > 0 ? lowestOffset : 1
+    int highestOffset = math.abs(ta.highestbars(high, lookbackVal))
+
+    lockedAnchorPrice   := low[lowestOffset]
+    lockedBreakoutPrice := high[highestOffset]
+
+    lastPeakPrice := lockedAnchorPrice
+    lastPeakType  := "PFL"
+    lastPeakBar   := bar_index - lowestOffset
+    btmmLevel     := 1
+
+    float swingRange = lockedBreakoutPrice - lockedAnchorPrice
+    fib618Level     := lockedAnchorPrice + (swingRange * 0.618)
+    fib786Level     := lockedAnchorPrice + (swingRange * 0.786)
+
+    string labelText = isSuperCycle ? "L3 / SUPER CYCLE\nPFL Confirmed" : "PFL Confirmed\n(L1 Expansion)"
+    color  labelColor = isSuperCycle ? color.blue : color.green
+    label.new(bar_index - lowestOffset, lockedAnchorPrice, labelText, color=labelColor, style=label.style_label_up, textcolor=color.white)
+
+    if showFibBoxes
+        box.delete(activeFibBox)
+        activeFibBox := box.new(bar_index, fib786Level, bar_index + 30, fib618Level, border_color=color.teal, bgcolor=color.new(color.teal, 85))
+
+    string _sig = isSuperCycle ? "SUPER CYCLE PFL" : "PFL Confirmed"
+    string _lvl = isSuperCycle ? "L3" : "L1"
+    alert(mkPayload(_sig, close, _lvl, lockedAnchorPrice, fib618Level, fib786Level, ema200, adrPips), alert.freq_once_per_bar_close)
+
+// ---------- 200 EMA RESET ----------
+float resetBuffer = adr * 0.12
+bool near200      = ta.lowest(low, 3) <= (ema200 + resetBuffer) and ta.highest(high, 3) >= (ema200 - resetBuffer)
+bool resetCooldown = na(lastResetBar) or (bar_index - lastResetBar >= 8)
+
+bool bounce200Up   = near200 and close > ema13 and ema13 > ema50 and ta.crossover(close, ema13)  and resetCooldown
+bool bounce200Down = near200 and close < ema13 and ema13 < ema50 and ta.crossunder(close, ema13) and resetCooldown
+
+if bounce200Up and barstate.isconfirmed
+    lastResetBar := bar_index
+    btmmLevel    := (btmmLevel == 1) ? 2 : (btmmLevel == 2 ? 3 : btmmLevel)
+    string lStr  = btmmLevel == 2 ? "L2 Continuation" : "L3 Exhaustion"
+    label.new(bar_index, low, "200 EMA Reset\n(" + lStr + " Long)", color=color.blue, style=label.style_label_up, textcolor=color.white)
+
+    string _sig = btmmLevel == 2 ? "200 EMA Reset L2" : "200 EMA Reset L3"
+    string _lvl = btmmLevel == 2 ? "L2" : "L3"
+    alert(mkPayload(_sig, close, _lvl, lockedAnchorPrice, fib618Level, fib786Level, ema200, adrPips), alert.freq_once_per_bar_close)
+
+if bounce200Down and barstate.isconfirmed
+    lastResetBar := bar_index
+    btmmLevel    := (btmmLevel == 1) ? 2 : (btmmLevel == 2 ? 3 : btmmLevel)
+    string lStr  = btmmLevel == 2 ? "L2 Continuation" : "L3 Exhaustion"
+    label.new(bar_index, high, "200 EMA Reset\n(" + lStr + " Short)", color=color.purple, style=label.style_label_down, textcolor=color.white)
+
+    string _sig = btmmLevel == 2 ? "200 EMA Reset L2" : "200 EMA Reset L3"
+    string _lvl = btmmLevel == 2 ? "L2" : "L3"
+    alert(mkPayload(_sig, close, _lvl, lockedAnchorPrice, fib618Level, fib786Level, ema200, adrPips), alert.freq_once_per_bar_close)
+
+// ==========================================
+// 5. PRIME ENTRY & TARGET LINES
+// ==========================================
+var line lineTP1 = na
+var line lineTP2 = na
+var line lineTP3 = na
+var bool entryTriggered = false
+
+if confirmedPFH or confirmedPFL
+    entryTriggered := false
+
+bool mTopSweep    = false
+bool wBottomSweep = false
+
+if lastPeakType == "PFH" and high >= fib786Level and high <= fib618Level
+    mTopSweep := not useSweepFilter or (high > high[1] and close < ema13)
+
+if lastPeakType == "PFL" and low <= fib786Level and low >= fib618Level
+    wBottomSweep := not useSweepFilter or (low < low[1] and close > ema13)
+
+bool shortSignal = false
+bool longSignal  = false
+
+// Prime Short
+if lastPeakType == "PFH" and not entryTriggered and inValidSession and mTopSweep
+    if close < ema13 and barstate.isconfirmed
+        entryTriggered := true
+        shortSignal    := true
+        label.new(bar_index, high, "PRIME SHORT\n(Sweep + L" + str.tostring(btmmLevel) + " Trend)", color=color.maroon, style=label.style_label_down, textcolor=color.white)
+
+        if showTPs
+            float swingRange = lockedAnchorPrice - lockedBreakoutPrice
+            float tp1 = ema200
+            float tp2 = lockedBreakoutPrice - (swingRange * 0.272)
+            float tp3 = close - adr
+            line.delete(lineTP1), line.delete(lineTP2), line.delete(lineTP3)
+            lineTP1 := line.new(bar_index, tp1, bar_index + 25, tp1, color=color.yellow, width=2)
+            lineTP2 := line.new(bar_index, tp2, bar_index + 25, tp2, color=color.orange, width=2)
+            lineTP3 := line.new(bar_index, tp3, bar_index + 25, tp3, color=color.red,    width=2)
+
+        string _lvl = btmmLevel == 3 ? "L3" : btmmLevel == 2 ? "L2" : "L1"
+        alert(mkPayload("PRIME SHORT", close, _lvl, lockedAnchorPrice, fib618Level, fib786Level, ema200, adrPips), alert.freq_once_per_bar_close)
+
+// Prime Long
+if lastPeakType == "PFL" and not entryTriggered and inValidSession and wBottomSweep
+    if close > ema13 and barstate.isconfirmed
+        entryTriggered := true
+        longSignal     := true
+        label.new(bar_index, low, "PRIME LONG\n(Sweep + L" + str.tostring(btmmLevel) + " Trend)", color=color.teal, style=label.style_label_up, textcolor=color.white)
+
+        if showTPs
+            float swingRange = lockedBreakoutPrice - lockedAnchorPrice
+            float tp1 = ema200
+            float tp2 = lockedBreakoutPrice + (swingRange * 0.272)
+            float tp3 = close + adr
+            line.delete(lineTP1), line.delete(lineTP2), line.delete(lineTP3)
+            lineTP1 := line.new(bar_index, tp1, bar_index + 25, tp1, color=color.yellow, width=2)
+            lineTP2 := line.new(bar_index, tp2, bar_index + 25, tp2, color=color.teal,   width=2)
+            lineTP3 := line.new(bar_index, tp3, bar_index + 25, tp3, color=color.green,  width=2)
+
+        string _lvl = btmmLevel == 3 ? "L3" : btmmLevel == 2 ? "L2" : "L1"
+        alert(mkPayload("PRIME LONG", close, _lvl, lockedAnchorPrice, fib618Level, fib786Level, ema200, adrPips), alert.freq_once_per_bar_close)
+
+// ==========================================
+// 6. LEGACY alertcondition() — chart-only labels for backwards compatibility
+// ==========================================
+alertcondition(confirmedPFH, title="Peak Formation High (PFH)", message="MMM Engine: PFH Confirmed on {{ticker}}.")
+alertcondition(confirmedPFL, title="Peak Formation Low (PFL)",  message="MMM Engine: PFL Confirmed on {{ticker}}.")
+alertcondition(shortSignal,  title="Prime Short Entry",         message="MMM Engine: PRIME SHORT on {{ticker}}.")
+alertcondition(longSignal,   title="Prime Long Entry",          message="MMM Engine: PRIME LONG on {{ticker}}.")
