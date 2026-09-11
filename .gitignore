@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+.env.local
+trading_agent.db
+*.db-journal
+.DS_Store
+.idea/
+.vscode/
