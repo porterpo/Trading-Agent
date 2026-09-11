@@ -63,12 +63,17 @@ class RiskConfig:
 
 @dataclass(frozen=True)
 class ExecConfig:
-    exchange_id: str = "oanda"
+    exchange_id: str = "mt5"
     account_id: str = ""
     api_key: str = ""
     api_secret: str = ""
     sandbox: bool = True
     default_leverage: int = 30
+    # MT5-only fields (ignored by ccxt backends)
+    mt5_server: str = ""          # broker's MT5 server name, e.g. "HFMarkets-Live"
+    mt5_terminal_path: str = ""   # optional absolute path to terminal64.exe
+    mt5_symbol_suffix: str = ""   # broker-specific suffix, e.g. ".a", "m", ".raw"
+    mt5_magic: int = 20260911     # magic number tagging every order from this agent
 
 
 @dataclass(frozen=True)
@@ -119,6 +124,10 @@ EXCHANGE = ExecConfig(
     api_secret=_env("EXCHANGE_API_SECRET"),
     sandbox=_env_bool("EXCHANGE_SANDBOX", True),
     default_leverage=_env_int("DEFAULT_LEVERAGE", 30),
+    mt5_server=_env("MT5_SERVER"),
+    mt5_terminal_path=_env("MT5_TERMINAL_PATH"),
+    mt5_symbol_suffix=_env("MT5_SYMBOL_SUFFIX"),
+    mt5_magic=_env_int("MT5_MAGIC", 20260911),
 )
 
 NOTIFY = NotificationConfig(

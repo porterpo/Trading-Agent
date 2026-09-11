@@ -1,10 +1,11 @@
 """Async order routing with a three-stage TP ladder.
 
-Two backends:
+Three backends:
+    * MT5 native adapter for MetaTrader 5 brokers (HFM, EasyMarkets, etc.) —
+      selected when `EXCHANGE_ID=mt5`. Windows only.
     * CCXT for crypto venues (Binance, Bybit, etc.)
     * A paper-trading simulator used when the configured exchange id is
-      `paper`, `mt5`, or `oanda` (the latter two aren't in modern ccxt —
-      swap in a native REST client when going live).
+      `paper` or an unknown value that isn't in ccxt.
 
 Position lifecycle:
     Open  → market entry with bracket (SL + TP1)
@@ -29,7 +30,8 @@ from models import OrderSide, TradePlan
 log = logging.getLogger(__name__)
 
 
-PAPER_EXCHANGE_IDS = {"paper", "mt5", "oanda"}
+PAPER_EXCHANGE_IDS = {"paper"}
+MT5_EXCHANGE_ID = "mt5"
 
 
 @dataclass
@@ -94,7 +96,11 @@ class ExchangeClient:
 
     def __init__(self) -> None:
         eid = EXCHANGE.exchange_id.lower()
-        if eid in PAPER_EXCHANGE_IDS or not hasattr(ccxt, eid):
+        if eid == MT5_EXCHANGE_ID:
+            from mt5_broker import MT5Broker
+            self.is_paper = False
+            self.ex = MT5Broker()
+        elif eid in PAPER_EXCHANGE_IDS or not hasattr(ccxt, eid):
             if eid not in PAPER_EXCHANGE_IDS:
                 log.warning(
                     "ccxt has no exchange '%s' — falling back to paper broker",

@@ -1,0 +1,12 @@
+{
+  "symbol": "EURUSD",
+  "timeframe": "60",
+  "signal": "PFH Confirmed",
+  "price": 1.16017,
+  "level": "L1",
+  "anchor_wick": 1.16250,
+  "fib_618": 1.16100,
+  "fib_786": 1.16000,
+  "ema_200": 1.15850,
+  "daily_adr_pips": 87.3
+}
