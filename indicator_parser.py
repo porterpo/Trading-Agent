@@ -19,7 +19,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field, ValidationError
 
 from config import WEBHOOK
-from db import init_db, log_signal
+from db import has_recent_signal, init_db, log_signal
 from models import IndicatorSignal, Level, SignalType
 
 log = logging.getLogger(__name__)
@@ -139,7 +139,20 @@ def create_app(queue: "asyncio.Queue[IndicatorSignal]") -> FastAPI:
             log.warning("bad payload: %s", e)
             raise HTTPException(status_code=400, detail=f"bad payload: {e}")
 
-        log_signal(sig, raw.decode(errors="replace"))
+        # Absorb TV webhook re-deliveries: same symbol+type+price inside a
+        # 15-min window is treated as a dup — logged for audit, not queued.
+        is_dup = has_recent_signal(
+            sig.symbol, sig.signal_type.value, sig.trigger_price,
+            within_minutes=15,
+        )
+        log_signal(sig, raw.decode(errors="replace"), is_duplicate=is_dup)
+        if is_dup:
+            log.info("dedup: %s %s @ %s within 15min — not queued",
+                     sig.symbol, sig.signal_type.value, sig.trigger_price)
+            return {"queued": False, "duplicate": True,
+                    "symbol": sig.symbol,
+                    "signal": sig.signal_type.value}
+
         await queue.put(sig)
         return {"queued": True, "symbol": sig.symbol,
                 "signal": sig.signal_type.value}

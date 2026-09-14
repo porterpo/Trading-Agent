@@ -8,7 +8,7 @@ from __future__ import annotations
 import sqlite3
 import threading
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Iterator, List, Optional
 
 from config import DB_PATH
@@ -27,7 +27,8 @@ CREATE TABLE IF NOT EXISTS signals (
     level TEXT,
     trigger_price REAL,
     daily_adr_pips REAL,
-    payload_json TEXT
+    payload_json TEXT,
+    is_duplicate INTEGER DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS trades (
@@ -78,6 +79,7 @@ CREATE TABLE IF NOT EXISTS btmm_state (
 
 CREATE INDEX IF NOT EXISTS idx_signals_ts     ON signals(ts);
 CREATE INDEX IF NOT EXISTS idx_signals_symbol ON signals(symbol);
+CREATE INDEX IF NOT EXISTS idx_signals_dedup  ON signals(symbol, signal_type, ts);
 CREATE INDEX IF NOT EXISTS idx_trades_status  ON trades(status);
 CREATE INDEX IF NOT EXISTS idx_trades_symbol  ON trades(symbol);
 CREATE INDEX IF NOT EXISTS idx_trades_signal  ON trades(signal_type);
@@ -92,6 +94,7 @@ _MIGRATIONS = [
     ("trades", "kill_zone", "TEXT"),
     ("trades", "adr_class", "TEXT"),
     ("trades", "exit_reason", "TEXT"),
+    ("signals", "is_duplicate", "INTEGER DEFAULT 0"),
 ]
 
 
@@ -121,19 +124,42 @@ def init_db() -> None:
                 pass  # column already exists — migration is a no-op
 
 
-def log_signal(sig: IndicatorSignal, payload_json: str) -> int:
+def log_signal(sig: IndicatorSignal, payload_json: str,
+               is_duplicate: bool = False) -> int:
     with _connect() as c:
         cur = c.execute(
             """INSERT INTO signals (ts, symbol, timeframe, signal_type, level,
-                                    trigger_price, daily_adr_pips, payload_json)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                                    trigger_price, daily_adr_pips, payload_json,
+                                    is_duplicate)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 sig.timestamp.isoformat(), sig.symbol, sig.timeframe,
                 sig.signal_type.value, sig.active_level.value,
                 sig.trigger_price, sig.daily_adr_pips, payload_json,
+                1 if is_duplicate else 0,
             ),
         )
         return int(cur.lastrowid)
+
+
+def has_recent_signal(symbol: str, signal_type: str,
+                       trigger_price: float,
+                       within_minutes: int = 15) -> bool:
+    """True if a non-duplicate signal with matching (symbol, type, price) was
+    logged within the window. Used to absorb TV webhook re-deliveries.
+    """
+    cutoff = (datetime.now(timezone.utc)
+              - timedelta(minutes=within_minutes)).isoformat()
+    with _connect() as c:
+        r = c.execute(
+            """SELECT 1 FROM signals
+                WHERE symbol=? AND signal_type=? AND trigger_price=?
+                  AND ts >= ?
+                  AND (is_duplicate IS NULL OR is_duplicate=0)
+                LIMIT 1""",
+            (symbol, signal_type, trigger_price, cutoff),
+        ).fetchone()
+        return r is not None
 
 
 def log_trade(plan: TradePlan, broker_order_id: Optional[str],
