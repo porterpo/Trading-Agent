@@ -37,19 +37,35 @@ CREATE TABLE IF NOT EXISTS trades (
     symbol TEXT NOT NULL,
     side TEXT NOT NULL,
     entry REAL,
+    fill_price REAL,
     sl REAL,
     tp1 REAL,
     tp2 REAL,
     tp3 REAL,
     lots REAL,
     risk_pct REAL,
+    equity_at_open REAL,
     level TEXT,
     signal_type TEXT,
+    kill_zone TEXT,
+    adr_class TEXT,
     rationale TEXT,
     status TEXT DEFAULT 'OPEN',
+    exit_reason TEXT,
     pnl_pips REAL,
     pnl_usd REAL,
     broker_order_id TEXT
+);
+
+CREATE TABLE IF NOT EXISTS partial_fills (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    trade_id INTEGER NOT NULL REFERENCES trades(id),
+    ts TEXT NOT NULL,
+    fill_type TEXT NOT NULL,
+    lots REAL NOT NULL,
+    price REAL,
+    pnl_pips REAL,
+    pnl_usd REAL
 );
 
 CREATE TABLE IF NOT EXISTS btmm_state (
@@ -64,7 +80,19 @@ CREATE INDEX IF NOT EXISTS idx_signals_ts     ON signals(ts);
 CREATE INDEX IF NOT EXISTS idx_signals_symbol ON signals(symbol);
 CREATE INDEX IF NOT EXISTS idx_trades_status  ON trades(status);
 CREATE INDEX IF NOT EXISTS idx_trades_symbol  ON trades(symbol);
+CREATE INDEX IF NOT EXISTS idx_trades_signal  ON trades(signal_type);
+CREATE INDEX IF NOT EXISTS idx_partials_trade ON partial_fills(trade_id);
 """
+
+# Columns added post-v1. SQLite lacks ADD COLUMN IF NOT EXISTS so we ALTER
+# inside a try/except — existing DBs migrate silently on next boot.
+_MIGRATIONS = [
+    ("trades", "fill_price", "REAL"),
+    ("trades", "equity_at_open", "REAL"),
+    ("trades", "kill_zone", "TEXT"),
+    ("trades", "adr_class", "TEXT"),
+    ("trades", "exit_reason", "TEXT"),
+]
 
 
 @contextmanager
@@ -86,6 +114,11 @@ def _now() -> str:
 def init_db() -> None:
     with _connect() as c:
         c.executescript(SCHEMA)
+        for table, col, coltype in _MIGRATIONS:
+            try:
+                c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {coltype}")
+            except sqlite3.OperationalError:
+                pass  # column already exists — migration is a no-op
 
 
 def log_signal(sig: IndicatorSignal, payload_json: str) -> int:
@@ -103,32 +136,51 @@ def log_signal(sig: IndicatorSignal, payload_json: str) -> int:
         return int(cur.lastrowid)
 
 
-def log_trade(plan: TradePlan, broker_order_id: Optional[str]) -> int:
+def log_trade(plan: TradePlan, broker_order_id: Optional[str],
+              *, kill_zone: Optional[str] = None,
+              adr_class: Optional[str] = None,
+              equity_at_open: Optional[float] = None,
+              fill_price: Optional[float] = None) -> int:
     with _connect() as c:
         cur = c.execute(
             """INSERT INTO trades
-                    (ts_open, symbol, side, entry, sl, tp1, tp2, tp3, lots,
-                     risk_pct, level, signal_type, rationale, broker_order_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (ts_open, symbol, side, entry, fill_price, sl, tp1, tp2, tp3,
+                     lots, risk_pct, equity_at_open, level, signal_type,
+                     kill_zone, adr_class, rationale, broker_order_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
-                _now(), plan.symbol, plan.side.value, plan.entry, plan.sl,
-                plan.tp1, plan.tp2, plan.tp3, plan.lots, plan.risk_pct,
-                plan.level.value, plan.signal_type.value, plan.rationale,
-                broker_order_id,
+                _now(), plan.symbol, plan.side.value, plan.entry, fill_price,
+                plan.sl, plan.tp1, plan.tp2, plan.tp3, plan.lots, plan.risk_pct,
+                equity_at_open, plan.level.value, plan.signal_type.value,
+                kill_zone, adr_class, plan.rationale, broker_order_id,
             ),
         )
         return int(cur.lastrowid)
 
 
+def log_partial_fill(trade_id: int, fill_type: str, lots: float,
+                     price: Optional[float] = None,
+                     pnl_pips: Optional[float] = None,
+                     pnl_usd: Optional[float] = None) -> None:
+    with _connect() as c:
+        c.execute(
+            """INSERT INTO partial_fills
+                    (trade_id, ts, fill_type, lots, price, pnl_pips, pnl_usd)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (trade_id, _now(), fill_type, lots, price, pnl_pips, pnl_usd),
+        )
+
+
 def update_trade_status(trade_id: int, status: str,
                         pnl_pips: Optional[float] = None,
-                        pnl_usd: Optional[float] = None) -> None:
+                        pnl_usd: Optional[float] = None,
+                        exit_reason: Optional[str] = None) -> None:
     with _connect() as c:
         c.execute(
             """UPDATE trades
-                  SET status=?, pnl_pips=?, pnl_usd=?, ts_close=?
+                  SET status=?, pnl_pips=?, pnl_usd=?, exit_reason=?, ts_close=?
                 WHERE id=?""",
-            (status, pnl_pips, pnl_usd, _now(), trade_id),
+            (status, pnl_pips, pnl_usd, exit_reason, _now(), trade_id),
         )
 
 

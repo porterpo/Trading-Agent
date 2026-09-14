@@ -24,8 +24,9 @@ from typing import Dict, Optional
 import ccxt.async_support as ccxt
 
 from config import EXCHANGE, RISK
-from db import log_trade, update_trade_status
+from db import log_partial_fill, log_trade, update_trade_status
 from models import OrderSide, TradePlan
+from risk_manager import pip_size, pip_value_usd
 
 log = logging.getLogger(__name__)
 
@@ -42,6 +43,17 @@ class OpenPosition:
     remaining_lots: float
     tp1_hit: bool = False
     tp2_hit: bool = False
+    cum_pnl_pips: float = 0.0
+    cum_pnl_usd: float = 0.0
+
+
+def _signed_pnl(plan: TradePlan, fill_price: float,
+                lots: float) -> tuple[float, float]:
+    """Signed pips + USD P&L for a partial close at `fill_price`."""
+    sign = 1.0 if plan.side == OrderSide.BUY else -1.0
+    pips = sign * (fill_price - plan.entry) / pip_size(plan.symbol)
+    usd = lots * pips * pip_value_usd(plan.symbol)
+    return pips, usd
 
 
 class _PaperBroker:
@@ -151,8 +163,13 @@ class ExchangeClient:
         t = await self.ex.fetch_ticker(symbol)
         return float(t.get("last") or t.get("close") or 0.0)
 
-    async def place_bracket(self, plan: TradePlan) -> str:
-        """Market order with attached SL + TP1. TP2/TP3 managed in-agent."""
+    async def place_bracket(self, plan: TradePlan) -> tuple[str, Optional[float]]:
+        """Market order with attached SL + TP1. TP2/TP3 managed in-agent.
+
+        Returns (order_id, fill_price). fill_price is None if the broker
+        response doesn't include a fill — journaled as NULL so slippage
+        stats don't get corrupted by falling back to the intended entry.
+        """
         params = {
             "stopLoss":   {"type": "stop",  "price": plan.sl},
             "takeProfit": {"type": "limit", "price": plan.tp1},
@@ -164,7 +181,10 @@ class ExchangeClient:
             amount=plan.lots,
             params=params,
         )
-        return str(order.get("id") or order.get("orderId") or "")
+        order_id = str(order.get("id") or order.get("orderId") or "")
+        fill = order.get("price") or order.get("average")
+        fill_price = float(fill) if fill else None
+        return order_id, fill_price
 
     async def modify_sl(self, symbol: str, order_id: str, new_sl: float) -> None:
         try:
@@ -174,11 +194,14 @@ class ExchangeClient:
             log.warning("modify_sl failed %s: %s", order_id, e)
 
     async def close_partial(self, symbol: str, side: OrderSide,
-                            lots: float) -> None:
+                            lots: float) -> Optional[float]:
+        """Returns the fill price if the broker reports one, else None."""
         if lots < 0.01:
-            return
+            return None
         opposite = OrderSide.SELL if side == OrderSide.BUY else OrderSide.BUY
-        await self.ex.create_order(symbol, "market", opposite.value, lots)
+        order = await self.ex.create_order(symbol, "market", opposite.value, lots)
+        fill = order.get("price") or order.get("average")
+        return float(fill) if fill else None
 
 
 class PositionManager:
@@ -189,14 +212,22 @@ class PositionManager:
         self._positions: Dict[int, OpenPosition] = {}
         self._stop = asyncio.Event()
 
-    async def open(self, plan: TradePlan) -> Optional[OpenPosition]:
+    async def open(self, plan: TradePlan, *,
+                   kill_zone: Optional[str] = None,
+                   adr_class: Optional[str] = None,
+                   equity_at_open: Optional[float] = None,
+                   ) -> Optional[OpenPosition]:
         try:
-            order_id = await self.ex.place_bracket(plan)
+            order_id, fill_price = await self.ex.place_bracket(plan)
         except Exception as e:
             log.exception("order placement failed: %s", e)
             return None
 
-        trade_id = log_trade(plan, order_id)
+        trade_id = log_trade(
+            plan, order_id,
+            kill_zone=kill_zone, adr_class=adr_class,
+            equity_at_open=equity_at_open, fill_price=fill_price,
+        )
         pos = OpenPosition(
             trade_id=trade_id, plan=plan,
             broker_order_id=order_id, remaining_lots=plan.lots,
@@ -214,10 +245,18 @@ class PositionManager:
             if lots < 0.01:
                 continue
             try:
-                await self.ex.close_partial(pos.plan.symbol, pos.plan.side, lots)
+                fill = await self.ex.close_partial(
+                    pos.plan.symbol, pos.plan.side, lots)
                 pos.remaining_lots = round(pos.remaining_lots - lots, 2)
                 await self.ex.modify_sl(pos.plan.symbol,
                                          pos.broker_order_id, pos.plan.entry)
+                pips = usd = None
+                if fill is not None:
+                    pips, usd = _signed_pnl(pos.plan, fill, lots)
+                    pos.cum_pnl_pips += pips
+                    pos.cum_pnl_usd += usd
+                log_partial_fill(pos.trade_id, "NEWS_HEDGE", lots,
+                                 price=fill, pnl_pips=pips, pnl_usd=usd)
                 log.info("pre-news: closed %.2f of %s, SL→BE",
                          lots, pos.plan.symbol)
             except Exception as e:
@@ -238,30 +277,55 @@ class PositionManager:
         tp1_hit = (price >= pos.plan.tp1) if long_side else (price <= pos.plan.tp1)
         if tp1_hit and not pos.tp1_hit:
             lots = round(pos.plan.lots * RISK.tp1_close_fraction, 2)
-            await self.ex.close_partial(pos.plan.symbol, pos.plan.side, lots)
+            fill = await self.ex.close_partial(
+                pos.plan.symbol, pos.plan.side, lots)
             pos.remaining_lots = round(pos.remaining_lots - lots, 2)
             await self.ex.modify_sl(pos.plan.symbol, pos.broker_order_id,
                                      pos.plan.entry)
             pos.tp1_hit = True
+            fill_px = fill if fill is not None else pos.plan.tp1
+            pips, usd = _signed_pnl(pos.plan, fill_px, lots)
+            pos.cum_pnl_pips += pips
+            pos.cum_pnl_usd += usd
+            log_partial_fill(pos.trade_id, "TP1", lots,
+                             price=fill_px, pnl_pips=pips, pnl_usd=usd)
             log.info("TP1 %s: closed %.2f, SL→BE", pos.plan.symbol, lots)
 
         # TP2: close configured fraction
         tp2_hit = (price >= pos.plan.tp2) if long_side else (price <= pos.plan.tp2)
         if tp2_hit and pos.tp1_hit and not pos.tp2_hit:
             lots = round(pos.plan.lots * RISK.tp2_close_fraction, 2)
-            await self.ex.close_partial(pos.plan.symbol, pos.plan.side, lots)
+            fill = await self.ex.close_partial(
+                pos.plan.symbol, pos.plan.side, lots)
             pos.remaining_lots = round(pos.remaining_lots - lots, 2)
             pos.tp2_hit = True
+            fill_px = fill if fill is not None else pos.plan.tp2
+            pips, usd = _signed_pnl(pos.plan, fill_px, lots)
+            pos.cum_pnl_pips += pips
+            pos.cum_pnl_usd += usd
+            log_partial_fill(pos.trade_id, "TP2", lots,
+                             price=fill_px, pnl_pips=pips, pnl_usd=usd)
             log.info("TP2 %s: closed %.2f", pos.plan.symbol, lots)
 
         # TP3 = 1x Daily ADR: close remainder
         tp3_hit = (price >= pos.plan.tp3) if long_side else (price <= pos.plan.tp3)
         if tp3_hit and pos.tp2_hit and pos.remaining_lots >= 0.01:
-            await self.ex.close_partial(pos.plan.symbol, pos.plan.side,
-                                         pos.remaining_lots)
-            update_trade_status(pos.trade_id, "CLOSED_TP3")
+            lots = pos.remaining_lots
+            fill = await self.ex.close_partial(
+                pos.plan.symbol, pos.plan.side, lots)
+            fill_px = fill if fill is not None else pos.plan.tp3
+            pips, usd = _signed_pnl(pos.plan, fill_px, lots)
+            pos.cum_pnl_pips += pips
+            pos.cum_pnl_usd += usd
+            log_partial_fill(pos.trade_id, "TP3", lots,
+                             price=fill_px, pnl_pips=pips, pnl_usd=usd)
+            update_trade_status(pos.trade_id, "CLOSED_TP3",
+                                pnl_pips=pos.cum_pnl_pips,
+                                pnl_usd=pos.cum_pnl_usd,
+                                exit_reason="TP3")
             self._positions.pop(pos.trade_id, None)
-            log.info("TP3 %s: fully closed", pos.plan.symbol)
+            log.info("TP3 %s: fully closed  pnl %.1fp / $%.2f",
+                     pos.plan.symbol, pos.cum_pnl_pips, pos.cum_pnl_usd)
 
     async def monitor_loop(self, interval: float = 3.0) -> None:
         while not self._stop.is_set():

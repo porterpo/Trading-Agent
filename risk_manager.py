@@ -148,12 +148,32 @@ def _risk_pct(sig: IndicatorSignal, level: Level) -> float:
 
 def compute_lots(equity_usd: float, risk_pct: float,
                  sl_pips: float, symbol: str) -> float:
-    """Standard fixed-fractional sizing scaled by structural SL."""
+    """Standard fixed-fractional sizing scaled by structural SL.
+
+    When equity is too small for the given SL, the 0.01-lot floor forces
+    a position that risks more than `risk_pct`. We still return the min
+    lot (so the trade isn't silently dropped), but log the breach and
+    the equity threshold needed to size cleanly.
+    """
     if sl_pips <= 0 or equity_usd <= 0:
         return 0.0
-    risk_usd = equity_usd * risk_pct
-    lots = risk_usd / (sl_pips * pip_value_usd(symbol))
-    return max(round(lots, 2), 0.01)
+    pip_val = pip_value_usd(symbol)
+    intended_risk = equity_usd * risk_pct
+    raw_lots = intended_risk / (sl_pips * pip_val)
+    lots = max(round(raw_lots, 2), 0.01)
+
+    if raw_lots < 0.01:
+        actual_risk = lots * sl_pips * pip_val
+        min_equity = 0.01 * sl_pips * pip_val / risk_pct
+        log.warning(
+            "min-lot floor over-risks %s: intended %.2f%% ($%.2f) -> "
+            "actual %.2f%% ($%.2f) at %.1f-pip SL. Need >= $%.0f equity "
+            "to size within %.2f%% risk.",
+            symbol, risk_pct * 100, intended_risk,
+            (actual_risk / equity_usd) * 100, actual_risk, sl_pips,
+            min_equity, risk_pct * 100,
+        )
+    return lots
 
 
 def build_plan(sig: IndicatorSignal, level: Level, bias: Bias,

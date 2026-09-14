@@ -59,6 +59,10 @@ class RiskConfig:
     tp1_close_fraction: float = 0.30
     tp2_close_fraction: float = 0.40
     tp2_fib_extension: float = 1.272
+    # Practical minimum equity for this plan: at $1000, an L1 trade
+    # (0.5% = $5) sizes to 0.01 lots on a $10/pip pair with a ~20-30
+    # pip structural SL without breaching the per-trade risk cap.
+    min_equity_usd: float = 1000.0
 
 
 @dataclass(frozen=True)

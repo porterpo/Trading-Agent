@@ -49,6 +49,9 @@ async def _handle_signal(sig: IndicatorSignal,
                           pm: PositionManager,
                           ex: ExchangeClient,
                           tg: Telegram) -> None:
+    # Cycle state ticks 24/5 — trade-entry gates come after.
+    state = await engine.apply(sig)
+
     kz = in_kill_zone()
     if not kz:
         log.info("skip %s %s — outside kill zone",
@@ -66,7 +69,6 @@ async def _handle_signal(sig: IndicatorSignal,
         log.info("skip %s — max concurrent positions reached", sig.symbol)
         return
 
-    state = await engine.apply(sig)
     reason = engine.is_actionable(sig, state)
     if reason:
         log.info("skip %s — %s", sig.symbol, reason)
@@ -89,7 +91,12 @@ async def _handle_signal(sig: IndicatorSignal,
              plan.symbol, plan.side.value, plan.lots, plan.entry,
              plan.sl, plan.tp1, plan.tp2, plan.tp3)
 
-    pos = await pm.open(plan)
+    pos = await pm.open(
+        plan,
+        kill_zone=kz,
+        adr_class=adr_class(sig.daily_adr_pips),
+        equity_at_open=equity,
+    )
     if pos:
         await tg.send(
             f"✅ *{plan.symbol}* {plan.side.value.upper()} {plan.lots} lots\n"
